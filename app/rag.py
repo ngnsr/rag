@@ -1,36 +1,62 @@
+import streamlit as st
 from sentence_transformers import SentenceTransformer
 import faiss
 from llama_cpp import Llama
+from timing import UITimer
 
-# Embeddings
-embedding_model = SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2"
-)
+@st.cache_resource
+def load_llm():
+    return Llama(
+        model_path="/models/mistral.gguf",
+        n_ctx=8192,
+    )
 
-DIM = 384
-index = faiss.IndexFlatL2(DIM)
-documents: list[str] = []
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# LLM (llama.cpp)
-llm = Llama(model_path="/models/mistral.gguf", n_ctx=8192)
+@st.cache_resource
+def load_index():
+    return faiss.IndexFlatL2(384)
+
+llm = load_llm()
+embedding_model = load_embedding_model()
+index = load_index()
+
+if "documents" not in st.session_state:
+    st.session_state.documents = []
 
 def add_document(text: str):
-    emb = embedding_model.encode([text])
-    index.add(emb)
-    documents.append(text)
+    with UITimer("embed(document)"):
+        emb = embedding_model.encode([text])
+
+    with UITimer("faiss.add"):
+        index.add(emb)
+
+    st.session_state.documents.append(text)
 
 def retrieve(query: str, k: int = 3):
-    q_emb = embedding_model.encode([query])
-    _, ids = index.search(q_emb, k)
-    retrieved = [documents[i] for i in ids[0] if i < len(documents)]
+    with UITimer("embed(query)"):
+        q_emb = embedding_model.encode([query])
+
+    with UITimer("faiss.search"):
+        _, ids = index.search(q_emb, k)
+
+    docs = st.session_state.documents
+    retrieved = [docs[i] for i in ids[0] if i < len(docs)]
+
     if not retrieved:
-        raise ValueError(f"No valid documents found for query: {query}")
+        raise ValueError("No valid documents found")
+
     return retrieved
 
 def generate_answer(query: str) -> str:
-    context = "\n\n".join(retrieve(query))
+    with UITimer("retrieve"):
+        context_docs = retrieve(query)
 
-    prompt = f"""You are a helpful assistant.
+    with UITimer("prompt.build"):
+        context = "\n\n".join(context_docs)
+        prompt = f"""You are a helpful assistant.
 Use ONLY the context below.
 
 Context:
@@ -41,11 +67,12 @@ Question:
 
 Answer:"""
 
-    output = llm(
-        prompt,
-        max_tokens=300,
-        temperature=0.2,
-        stop=["</s>"]
-    )
+    with UITimer("llm.inference"):
+        output = llm(
+            prompt,
+            max_tokens=300,
+            temperature=0.2,
+            stop=["</s>"],
+        )
 
     return output["choices"][0]["text"].strip()
